@@ -32,7 +32,21 @@ final class VNCBridge: @unchecked Sendable {
     // Buffer allocation can precede a failed native handshake. Only a successful
     // initialize call makes the client available to readers, input and observers.
     private var clientReady = false
+    private var framebufferReceivedPixels = false
+    private var framebufferHasUpdate = false
     private var ownedFramebuffer: UnsafeMutablePointer<UInt8>?
+    private final class FrameWaiter {
+        let id = UUID()
+        var continuation: CheckedContinuation<Void, Error>?
+        var cancelled = false
+        var deadline: DispatchWorkItem?
+    }
+    private struct FrameReadiness {
+        var available = false
+        var complete = false
+        var waiters: [UUID: FrameWaiter] = [:]
+    }
+    private let frameReadiness = OSAllocatedUnfairLock(initialState: FrameReadiness())
     private let stateStorage = OSAllocatedUnfairLock(initialState: VNCConnectionState.disconnected)
     // Desired connection identity is independently cancellable while a bounded
     // native call occupies the queue. Every C client access belongs to the queue.
@@ -42,6 +56,7 @@ final class VNCBridge: @unchecked Sendable {
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let operations: VNCClientOperations
     private let schedule: VNCWorkScheduler
+    private let scheduleFrameDeadline: VNCWorkScheduler
     private let messageQueue = DispatchQueue(label: "vnc.message-loop", qos: .userInteractive)
     /// Only touched on messageQueue (message loop).
     private var lastUpdateRequestNs: UInt64 = 0
@@ -56,10 +71,12 @@ final class VNCBridge: @unchecked Sendable {
 
     init(config: VNCConfiguration = .init(),
          operations: VNCClientOperations = .native,
-         schedule: @escaping VNCWorkScheduler = scheduleVNCWork) {
+         schedule: @escaping VNCWorkScheduler = scheduleVNCWork,
+         scheduleFrameDeadline: @escaping VNCWorkScheduler = scheduleVNCWork) {
         self.config = config
         self.operations = operations
         self.schedule = schedule
+        self.scheduleFrameDeadline = scheduleFrameDeadline
         messageQueue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -87,6 +104,8 @@ final class VNCBridge: @unchecked Sendable {
     }
 
     private func releaseFramebuffer() {
+        framebufferReceivedPixels = false
+        framebufferHasUpdate = false
         if let buffer = ownedFramebuffer {
             ownedFramebuffer = nil
             operations.freeFramebuffer(buffer)
@@ -95,6 +114,7 @@ final class VNCBridge: @unchecked Sendable {
 
     private func cleanupClient() {
         clientReady = false
+        publishFrameReadiness(available: false, complete: false)
         if let owned = client {
             client = nil
             owned.pointee.frameBuffer = nil
@@ -119,12 +139,37 @@ final class VNCBridge: @unchecked Sendable {
               size <= Self.maximumFramebufferBytes else { return 0 }
         native.pointee.frameBuffer = nil
         releaseFramebuffer()
+        publishFrameReadiness(available: activeClient != nil, complete: false)
         guard let buffer = operations.allocateFramebuffer(size) else { return 0 }
         memset(buffer, 0, size)
         ownedFramebuffer = buffer
         native.pointee.frameBuffer = buffer
         if clientReady { updateState(.connected(width: width, height: height)) }
         return -1
+    }
+
+    /// LibVNCClient skips this rectangle callback for cursor/size pseudo-encodings.
+    /// Never inspect pixel color: an actually received black rectangle is valid.
+    func receivedFramebufferRectangle(for native: UnsafeMutablePointer<rfbClient>,
+                                      x: Int32, y: Int32, width: Int32, height: Int32) {
+        guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
+              native.pointee.frameBuffer != nil,
+              let session = clientSession, wants(session),
+              x >= 0, y >= 0, width > 0, height > 0,
+              Int64(x) + Int64(width) <= Int64(native.pointee.width),
+              Int64(y) + Int64(height) <= Int64(native.pointee.height) else { return }
+        framebufferReceivedPixels = true
+    }
+
+    /// Completion alone also fires for empty or cursor-only messages. Require
+    /// both received pixels for this allocation and a fully processed message.
+    func finishedFramebufferUpdate(for native: UnsafeMutablePointer<rfbClient>) {
+        guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
+              native.pointee.frameBuffer != nil, framebufferReceivedPixels,
+              let session = clientSession, wants(session) else { return }
+        framebufferHasUpdate = true
+        if clientReady { publishFrameReadiness(available: true, complete: true) }
+        framebufferUpdateContinuation?.yield(())
     }
 
     // MARK: - Connection Lifecycle
@@ -211,6 +256,7 @@ final class VNCBridge: @unchecked Sendable {
         rfbClientSetClientData(newClient, &vncBridgeTag,
                               Unmanaged.passUnretained(self).toOpaque())
         newClient.pointee.MallocFrameBuffer = vncMallocFrameBuffer
+        newClient.pointee.GotFrameBufferUpdate = vncGotFrameBufferUpdate
         newClient.pointee.FinishedFrameBufferUpdate = vncFinishedFrameBufferUpdate
         newClient.pointee.GetPassword = vncGetPassword
         newClient.pointee.GetCredential = vncGetCredential
@@ -232,6 +278,7 @@ final class VNCBridge: @unchecked Sendable {
             throw CancellationError()
         }
         clientReady = true
+        publishFrameReadiness(available: true, complete: framebufferHasUpdate)
         updateState(.connected(width: Int(newClient.pointee.width), height: Int(newClient.pointee.height)))
         // A connected callback may request disconnect; never schedule work or
         // report connect success after that callback cancels this generation.
@@ -285,12 +332,75 @@ final class VNCBridge: @unchecked Sendable {
 
     func withFramebuffer<T>(_ body: (UnsafeRawBufferPointer, Int, Int) -> T) -> T? {
         onMessageQueue {
-            guard let client = activeClient, let pointer = client.pointee.frameBuffer else { return nil }
+            guard framebufferHasUpdate, let client = activeClient,
+                  let pointer = client.pointee.frameBuffer else { return nil }
             let width = Int(client.pointee.width)
             let height = Int(client.pointee.height)
             let bpp = Int(client.pointee.format.bitsPerPixel) / 8
             let buffer = UnsafeRawBufferPointer(start: UnsafeRawPointer(pointer), count: width * height * bpp)
             return body(buffer, width, height)
+        }
+    }
+
+    private func publishFrameReadiness(available: Bool, complete: Bool) {
+        let continuations = frameReadiness.withLock { state -> [CheckedContinuation<Void, Error>] in
+            state.available = available
+            state.complete = complete
+            guard !available || complete else { return [] }
+            let waiting = state.waiters.values.compactMap { waiter -> CheckedContinuation<Void, Error>? in
+                waiter.deadline?.cancel()
+                let continuation = waiter.continuation
+                waiter.continuation = nil
+                return continuation
+            }
+            state.waiters.removeAll()
+            return waiting
+        }
+        for continuation in continuations {
+            if available { continuation.resume() }
+            else { continuation.resume(throwing: VNCError.notConnected) }
+        }
+    }
+
+    private func finishFrameWait(_ waiter: FrameWaiter, cancelled: Bool) {
+        let continuation = frameReadiness.withLock { state -> CheckedContinuation<Void, Error>? in
+            if cancelled { waiter.cancelled = true }
+            guard state.waiters.removeValue(forKey: waiter.id) != nil else { return nil }
+            waiter.deadline?.cancel()
+            let continuation = waiter.continuation
+            waiter.continuation = nil
+            return continuation
+        }
+        guard let continuation else { return }
+        if cancelled { continuation.resume(throwing: CancellationError()) }
+        else { continuation.resume(throwing: VNCError.sendFailed("No complete framebuffer update within 5 seconds")) }
+    }
+
+    /// Wait without occupying the native queue: it must keep receiving pixels.
+    /// The independent deadline also completes while a native read is occupied.
+    func waitForFramebuffer() async throws {
+        let waiter = FrameWaiter()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let deadline = DispatchWorkItem { [weak self, weak waiter] in
+                    guard let self, let waiter else { return }
+                    self.finishFrameWait(waiter, cancelled: false)
+                }
+                let immediate = frameReadiness.withLock { state -> Result<Void, Error>? in
+                    if waiter.cancelled { return .failure(CancellationError()) }
+                    if !state.available { return .failure(VNCError.notConnected) }
+                    if state.complete { return .success(()) }
+                    waiter.continuation = continuation
+                    waiter.deadline = deadline
+                    state.waiters[waiter.id] = waiter
+                    return nil
+                }
+                if let immediate { continuation.resume(with: immediate) }
+                else { scheduleFrameDeadline(.global(qos: .userInitiated), 5, deadline) }
+            }
+            try Task.checkCancellation()
+        } onCancel: {
+            self.finishFrameWait(waiter, cancelled: true)
         }
     }
 

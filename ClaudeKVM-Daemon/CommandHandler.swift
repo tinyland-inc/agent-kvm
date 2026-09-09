@@ -55,6 +55,13 @@ extension ClaudeKVMDaemon {
         let p = req.params
 
         do {
+            // A zeroed allocation is not a screenshot. Wait for the first whole
+            // update of this connection/size, without holding the receive queue.
+            switch req.method {
+            case "screenshot", "cursor_crop", "diff_check", "set_baseline", "detect_elements":
+                try await vnc.waitForFramebuffer()
+            default: break
+            }
             switch req.method {
 
             // ── Screen ────────────────────────────────────────
@@ -81,15 +88,16 @@ extension ClaudeKVMDaemon {
                                   x: scaledPos.x, y: scaledPos.y))
 
             case "diff_check":
-                let changed = vnc.withFramebuffer { buf, _, _ -> Bool in
+                guard let changed = vnc.withFramebuffer({ buf, _, _ -> Bool in
                     diffCheck(buffer: buf)
-                } ?? false
+                }) else { throw VNCError.sendFailed("No framebuffer") }
                 respond(.success(id: id, detail: "changeDetected: \(changed)"))
 
             case "set_baseline":
-                vnc.withFramebuffer { buf, _, _ in
+                guard vnc.withFramebuffer({ buf, _, _ in
                     Self.baselineBuffer = Data(buf)
-                }
+                    return true
+                }) != nil else { throw VNCError.sendFailed("No framebuffer") }
                 respond(.success(id: id, detail: "OK"))
 
             // ── Mouse ─────────────────────────────────────────
@@ -183,9 +191,9 @@ extension ClaudeKVMDaemon {
             // ── Detection ──────────────────────────────────────
 
             case "detect_elements":
-                let elements = vnc.withFramebuffer { buf, w, h -> [TextElement] in
+                guard let elements = vnc.withFramebuffer({ buf, w, h -> [TextElement] in
                     detectTextElements(buffer: buf, width: w, height: h, scaling: scaling)
-                } ?? []
+                }) else { throw VNCError.sendFailed("No framebuffer") }
                 respond(.success(id: id, detail: "\(elements.count) elements",
                                   scaledWidth: scaling.scaledWidth, scaledHeight: scaling.scaledHeight,
                                   elements: elements))

@@ -21,10 +21,18 @@ func vncMallocFrameBuffer(_ client: UnsafeMutablePointer<rfbClient>?) -> rfbBool
     return b.allocateFramebuffer(for: client)
 }
 
+/// Called after a pixel rectangle is decoded, separately from cursor metadata.
+func vncGotFrameBufferUpdate(_ client: UnsafeMutablePointer<rfbClient>?,
+                            _ x: Int32, _ y: Int32, _ width: Int32, _ height: Int32) {
+    guard let client, let b = bridge(from: client) else { return }
+    b.receivedFramebufferRectangle(for: client, x: x, y: y, width: width, height: height)
+}
+
 /// Called once when all rectangles in a framebuffer update have been received.
 func vncFinishedFrameBufferUpdate(_ client: UnsafeMutablePointer<rfbClient>?) {
+    guard let client else { return }
     guard let b = bridge(from: client) else { return }
-    b.framebufferUpdateContinuation?.yield(())
+    b.finishedFramebufferUpdate(for: client)
 }
 
 /// Called by LibVNC when a password is needed for VNC authentication.
