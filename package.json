@@ -31,7 +31,8 @@
   ],
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:offline": "node --test --test-concurrency=1 test/credential-transport.test.js test/credential-proxy-integration.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

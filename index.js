@@ -18,11 +18,11 @@
  * Communication: PC (Procedure Call) over stdin/stdout NDJSON.
  */
 
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { vncCommandTool, actionQueueTool, controlTools } from './tools/index.js';
+import { takeCredential, spawnCredentialDaemon } from './tools/credential-transport.js';
 
 // ── Configuration ───────────────────────────────────────────
 
@@ -33,7 +33,7 @@ const DAEMON_PARAMS = env('CLAUDE_KVM_DAEMON_PARAMETERS', '');
 const VNC_HOST = env('VNC_HOST', '127.0.0.1');
 const VNC_PORT = env('VNC_PORT', '5900');
 const VNC_USERNAME = env('VNC_USERNAME', '');
-const VNC_PASSWORD = env('VNC_PASSWORD', '');
+const vncCredential = takeCredential(process.env);
 
 // ── Logging ─────────────────────────────────────────────────
 
@@ -53,7 +53,6 @@ let lineBuffer = '';
 function buildDaemonArgs() {
   const args = ['--host', VNC_HOST, '--port', VNC_PORT];
   if (VNC_USERNAME) args.push('--username', VNC_USERNAME);
-  if (VNC_PASSWORD) args.push('--password', VNC_PASSWORD);
 
   // Extra parameters — passed directly to daemon CLI
   if (DAEMON_PARAMS) {
@@ -66,11 +65,10 @@ function buildDaemonArgs() {
 
 function spawnDaemon() {
   const args = buildDaemonArgs();
-  log(`Spawning daemon: ${DAEMON_PATH} ${args.join(' ')}`);
+  log('Spawning native VNC daemon');
 
-  daemon = spawn(DAEMON_PATH, args, {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  daemon = spawnCredentialDaemon(DAEMON_PATH, args, vncCredential, process.env,
+    () => log('Native credential channel failed'));
 
   daemon.stdout.on('data', (chunk) => {
     lineBuffer += chunk.toString();
