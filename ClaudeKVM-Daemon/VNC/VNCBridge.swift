@@ -32,7 +32,13 @@ final class VNCBridge: @unchecked Sendable {
     // Buffer allocation can precede a failed native handshake. Only a successful
     // initialize call makes the client available to readers, input and observers.
     private var clientReady = false
-    private var framebufferReceivedPixels = false
+    // One bit per pixel, bounded by the checked framebuffer allocation (at
+    // most 32 MiB even for one-byte pixels). Discarded after initial coverage.
+    // A rectangle count or summed area cannot detect overlap and holes.
+    private var initialFramebufferCoverage: [UInt64] = []
+    private var framebufferPixelsRemaining = 0
+    private var nativeCopyRectangle: GotCopyRectProc?
+    private var copyRectanglePending = false
     private var framebufferHasUpdate = false
     private var ownedFramebuffer: UnsafeMutablePointer<UInt8>?
     private final class FrameWaiter {
@@ -104,7 +110,9 @@ final class VNCBridge: @unchecked Sendable {
     }
 
     private func releaseFramebuffer() {
-        framebufferReceivedPixels = false
+        initialFramebufferCoverage = []
+        framebufferPixelsRemaining = 0
+        copyRectanglePending = false
         framebufferHasUpdate = false
         if let buffer = ownedFramebuffer {
             ownedFramebuffer = nil
@@ -123,6 +131,7 @@ final class VNCBridge: @unchecked Sendable {
         } else {
             releaseFramebuffer()
         }
+        nativeCopyRectangle = nil
     }
 
     /// Only invoked synchronously by the C allocation callback on messageQueue.
@@ -144,6 +153,8 @@ final class VNCBridge: @unchecked Sendable {
         memset(buffer, 0, size)
         ownedFramebuffer = buffer
         native.pointee.frameBuffer = buffer
+        initialFramebufferCoverage = Array(repeating: 0, count: (pixels + 63) / 64)
+        framebufferPixelsRemaining = pixels
         if clientReady { updateState(.connected(width: width, height: height)) }
         return -1
     }
@@ -154,20 +165,79 @@ final class VNCBridge: @unchecked Sendable {
                                       x: Int32, y: Int32, width: Int32, height: Int32) {
         guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
               native.pointee.frameBuffer != nil,
-              let session = clientSession, wants(session),
-              x >= 0, y >= 0, width > 0, height > 0,
+              let session = clientSession, wants(session) else { return }
+        // LibVNCClient emits GotFrameBufferUpdate after GotCopyRect too. The
+        // copy callback has already propagated validity from its source region.
+        if copyRectanglePending { copyRectanglePending = false; return }
+        guard x >= 0, y >= 0, width > 0, height > 0,
               Int64(x) + Int64(width) <= Int64(native.pointee.width),
               Int64(y) + Int64(height) <= Int64(native.pointee.height) else { return }
-        framebufferReceivedPixels = true
+        guard !framebufferHasUpdate else { return }
+        // Track the union, including rectangles split across update messages.
+        // Work is bounded by rectangle area; duplicate rectangles add no bits.
+        let stride = Int(native.pointee.width)
+        for row in Int(y)..<(Int(y) + Int(height)) {
+            var offset = row * stride + Int(x)
+            let end = offset + Int(width)
+            while offset < end {
+                let word = offset / 64
+                let bit = offset % 64
+                let count = min(64 - bit, end - offset)
+                let mask = (UInt64.max >> (64 - count)) << bit
+                let unseen = mask & ~initialFramebufferCoverage[word]
+                initialFramebufferCoverage[word] |= mask
+                framebufferPixelsRemaining -= unseen.nonzeroBitCount
+                offset += count
+            }
+        }
     }
 
-    /// Completion alone also fires for empty or cursor-only messages. Require
-    /// both received pixels for this allocation and a fully processed message.
+    /// Preserve LibVNCClient's renderer and copy validity in the same overlap
+    /// order. CopyRect transmits no pixels: copying an unreceived source cannot
+    /// fill a hole, and can invalidate a previously received destination.
+    func receivedCopyRectangle(for native: UnsafeMutablePointer<rfbClient>,
+                               sourceX: Int32, sourceY: Int32, width: Int32, height: Int32,
+                               destinationX: Int32, destinationY: Int32) {
+        guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
+              native.pointee.frameBuffer != nil,
+              let session = clientSession, wants(session) else { return }
+        copyRectanglePending = true
+        let stride = Int(native.pointee.width), rows = Int(native.pointee.height)
+        guard let render = nativeCopyRectangle,
+              sourceX >= 0, sourceY >= 0, destinationX >= 0, destinationY >= 0,
+              width > 0, height > 0,
+              Int64(sourceX) + Int64(width) <= Int64(stride),
+              Int64(destinationX) + Int64(width) <= Int64(stride),
+              Int64(sourceY) + Int64(height) <= Int64(rows),
+              Int64(destinationY) + Int64(height) <= Int64(rows) else { return }
+        render(native, sourceX, sourceY, width, height, destinationX, destinationY)
+        guard !framebufferHasUpdate else { return }
+        for rowIndex in 0..<Int(height) {
+            let row = destinationY > sourceY ? Int(height) - 1 - rowIndex : rowIndex
+            for columnIndex in 0..<Int(width) {
+                let column = destinationX > sourceX ? Int(width) - 1 - columnIndex : columnIndex
+                let source = (Int(sourceY) + row) * stride + Int(sourceX) + column
+                let destination = (Int(destinationY) + row) * stride + Int(destinationX) + column
+                let received = initialFramebufferCoverage[source / 64] & (UInt64(1) << (source % 64)) != 0
+                let mask = UInt64(1) << (destination % 64)
+                let wasReceived = initialFramebufferCoverage[destination / 64] & mask != 0
+                if received != wasReceived {
+                    initialFramebufferCoverage[destination / 64] ^= mask
+                    framebufferPixelsRemaining += received ? -1 : 1
+                }
+            }
+        }
+    }
+
+    /// Completion alone also fires for partial, empty or cursor-only messages.
+    /// Require every pixel in this allocation and a fully processed message.
+    /// Once initialized, later incremental updates need not cover the screen.
     func finishedFramebufferUpdate(for native: UnsafeMutablePointer<rfbClient>) {
         guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
-              native.pointee.frameBuffer != nil, framebufferReceivedPixels,
+              native.pointee.frameBuffer != nil, framebufferPixelsRemaining == 0,
               let session = clientSession, wants(session) else { return }
         framebufferHasUpdate = true
+        initialFramebufferCoverage = []
         if clientReady { publishFrameReadiness(available: true, complete: true) }
         framebufferUpdateContinuation?.yield(())
     }
@@ -258,6 +328,8 @@ final class VNCBridge: @unchecked Sendable {
         newClient.pointee.MallocFrameBuffer = vncMallocFrameBuffer
         newClient.pointee.GotFrameBufferUpdate = vncGotFrameBufferUpdate
         newClient.pointee.FinishedFrameBufferUpdate = vncFinishedFrameBufferUpdate
+        nativeCopyRectangle = newClient.pointee.GotCopyRect
+        newClient.pointee.GotCopyRect = vncGotCopyRect
         newClient.pointee.GetPassword = vncGetPassword
         newClient.pointee.GetCredential = vncGetCredential
         newClient.pointee.GotXCutText = vncGotXCutText

@@ -28,6 +28,15 @@ func vncGotFrameBufferUpdate(_ client: UnsafeMutablePointer<rfbClient>?,
     b.receivedFramebufferRectangle(for: client, x: x, y: y, width: width, height: height)
 }
 
+func vncGotCopyRect(_ client: UnsafeMutablePointer<rfbClient>?,
+                   _ sourceX: Int32, _ sourceY: Int32, _ width: Int32, _ height: Int32,
+                   _ destinationX: Int32, _ destinationY: Int32) {
+    guard let client, let b = bridge(from: client) else { return }
+    b.receivedCopyRectangle(for: client, sourceX: sourceX, sourceY: sourceY,
+                            width: width, height: height,
+                            destinationX: destinationX, destinationY: destinationY)
+}
+
 /// Called once when all rectangles in a framebuffer update have been received.
 func vncFinishedFrameBufferUpdate(_ client: UnsafeMutablePointer<rfbClient>?) {
     guard let client else { return }

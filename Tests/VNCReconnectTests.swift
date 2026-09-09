@@ -427,6 +427,167 @@ final class VNCReconnectTests: XCTestCase {
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
     }
 
+    func testPartialInitialUpdatesOverlapAndHolesCannotAdmitOrRenewDeadline() async throws {
+        let native = FakeNative(polls: [true, true]); native.completeDuringInitialize = false
+        let clock = ManualScheduler(); let deadline = ManualScheduler()
+        let registered = expectation(description: "partial initial screen retains original deadline")
+        deadline.onSchedule = { registered.fulfill() }
+        let bridge = VNCBridge(operations: native.operations, schedule: clock.schedule,
+                               scheduleFrameDeadline: deadline.schedule)
+        try await bridge.connect()
+        let waiting = Task { try await bridge.waitForFramebuffer() }
+        await fulfillment(of: [registered], timeout: 3)
+        native.beforePoll = { [weak bridge] client in
+            // Summed area exceeds the screen; the bottom-right pixel is still
+            // absent. Completion of each message cannot bless that hole.
+            let rectangles: [(Int32, Int32, Int32, Int32)] =
+                [(0, 0, 2, 1), (0, 0, 2, 1), (0, 0, 1, 2)]
+            for (x, y, w, h) in rectangles {
+                vncGotFrameBufferUpdate(client, x, y, w, h)
+                vncFinishedFrameBufferUpdate(client)
+                XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            }
+        }
+        clock.runNext()
+        XCTAssertEqual(deadline.delays, [5])
+        deadline.runNext()
+        do { try await waiting.value; XCTFail("partial screen admitted") }
+        catch VNCError.sendFailed(let reason) {
+            XCTAssertEqual(reason, "No complete framebuffer update within 5 seconds")
+        } catch { XCTFail("unexpected error") }
+        native.beforePoll = { [weak bridge] client in
+            vncGotFrameBufferUpdate(client, 1, 1, 1, 1)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer.count }, 16)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.live, 0)
+    }
+
+    func testCoverageAcrossWordAndRowBoundariesRequiresLastPixel() async throws {
+        let native = FakeNative(polls: [true]); native.completeDuringInitialize = false
+        let clock = ManualScheduler(); let bridge = VNCBridge(operations: native.operations,
+                                                              schedule: clock.schedule)
+        try await bridge.connect()
+        native.beforePoll = { [weak bridge] client in
+            client.pointee.width = 67; client.pointee.height = 2
+            XCTAssertNotEqual(vncMallocFrameBuffer(client), 0)
+            // A 67-pixel stride exercises both word boundaries and a partial
+            // final word. Duplicate top-right coverage cannot fill bottom-right.
+            let rectangles: [(Int32, Int32, Int32, Int32)] =
+                [(0, 0, 64, 2), (64, 0, 3, 1), (64, 0, 3, 1), (64, 1, 2, 1)]
+            for (x, y, w, h) in rectangles {
+                vncGotFrameBufferUpdate(client, x, y, w, h)
+                vncFinishedFrameBufferUpdate(client)
+                XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            }
+            vncGotFrameBufferUpdate(client, 66, 1, 1, 1)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, width, height in
+            XCTAssertEqual(width, 67); XCTAssertEqual(height, 2); return buffer.count
+        }, 536)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.allocated, native.bufferCounts.released)
+    }
+
+    func testResizeDiscardsPartialCoverageEvenWhenDimensionsStayEqual() async throws {
+        let native = FakeNative(polls: [true]); native.completeDuringInitialize = false
+        let clock = ManualScheduler(); let bridge = VNCBridge(operations: native.operations,
+                                                              schedule: clock.schedule)
+        try await bridge.connect()
+        native.beforePoll = { [weak bridge] client in
+            vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            XCTAssertNotEqual(vncMallocFrameBuffer(client), 0)
+            vncGotFrameBufferUpdate(client, 0, 1, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer.count }, 16)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.allocated, 2)
+        XCTAssertEqual(native.bufferCounts.released, 2)
+    }
+
+    func testInitializedFramebufferStillAcceptsSmallIncrementalUpdates() async throws {
+        let native = FakeNative(polls: [true]); let clock = ManualScheduler()
+        let bridge = VNCBridge(operations: native.operations, schedule: clock.schedule)
+        try await bridge.connect(); try await bridge.waitForFramebuffer()
+        native.beforePoll = { client in
+            client.pointee.frameBuffer?[12] = 0x7F
+            vncGotFrameBufferUpdate(client, 1, 1, 1, 1)
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer[12] }, 0x7F)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.live, 0)
+    }
+
+    func testCopyRectPropagatesUnknownAndReceivedPixelsWithoutInventingCoverage() async throws {
+        let native = FakeNative(polls: [true]); native.completeDuringInitialize = false
+        let clock = ManualScheduler(); let bridge = VNCBridge(operations: native.operations,
+                                                              schedule: clock.schedule)
+        try await bridge.connect()
+        native.beforePoll = { [weak bridge] client in
+            client.pointee.frameBuffer?[0] = 0x6A
+            vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+            // Copy unreceived bottom pixels over the received top row. The
+            // subsequent generic callback must not mark that row as received.
+            vncGotCopyRect(client, 0, 1, 2, 1, 0, 0)
+            vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            client.pointee.frameBuffer?[8] = 0x4B
+            vncGotFrameBufferUpdate(client, 0, 1, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncGotCopyRect(client, 0, 1, 2, 1, 0, 0)
+            vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer[0] }, 0x4B)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.live, 0)
+    }
+
+    func testOverlappingCopyRectCannotSpreadOneKnownPixelAcrossUnknownSource() async throws {
+        let native = FakeNative(polls: [true]); native.completeDuringInitialize = false
+        let clock = ManualScheduler(); let bridge = VNCBridge(operations: native.operations,
+                                                              schedule: clock.schedule)
+        try await bridge.connect()
+        native.beforePoll = { [weak bridge] client in
+            client.pointee.width = 4; client.pointee.height = 1
+            XCTAssertNotEqual(vncMallocFrameBuffer(client), 0)
+            vncGotFrameBufferUpdate(client, 0, 0, 1, 1)
+            vncFinishedFrameBufferUpdate(client)
+            // memmove order: only positions 0 and 1 can become valid. A
+            // left-to-right validity copy would incorrectly fill all four.
+            vncGotCopyRect(client, 0, 0, 3, 1, 1, 0)
+            vncGotFrameBufferUpdate(client, 1, 0, 3, 1)
+            vncFinishedFrameBufferUpdate(client)
+            XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
+            vncGotFrameBufferUpdate(client, 2, 0, 2, 1)
+            vncFinishedFrameBufferUpdate(client)
+        }
+        clock.runNext(); try await bridge.waitForFramebuffer()
+        XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer.count }, 16)
+        bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
+        XCTAssertEqual(native.bufferCounts.allocated, native.bufferCounts.released)
+    }
+
     func testEmptyOrMetadataOnlyCompletionDoesNotAdmitUntouchedPixels() async throws {
         let native = FakeNative(polls: [true, true]); native.completeDuringInitialize = false
         let clock = ManualScheduler(); let deadline = ManualScheduler()
