@@ -135,9 +135,9 @@ struct ClaudeKVMDaemon: AsyncParsableCommand {
               for correct Command key behavior on Apple VNC servers.
 
             EXAMPLES:
-              claude-kvm-daemon --host 192.168.1.100 --port 5900 --password secret
-              claude-kvm-daemon --host 10.0.0.1 --port 5900 --username admin --password pass -v
-              claude-kvm-daemon --host 10.0.0.1 --port 5900 --password pass --max-dimension 800
+              Launched by the MCP proxy with --password-fd 3.
+              Descriptor 3 carries a bounded credential frame; stdin remains PC NDJSON.
+              Plaintext password arguments and environment fallbacks are unsupported.
 
             OUTPUT:
               stdout  PC responses and notifications (NDJSON).
@@ -158,8 +158,8 @@ struct ClaudeKVMDaemon: AsyncParsableCommand {
     @Option(name: .long, help: "VNC username (required for macOS ARD auth).")
     var username: String?
 
-    @Option(name: .long, help: "VNC server password.")
-    var password: String?
+    @Option(name: .customLong("password-fd"), help: "Private credential pipe/socket descriptor (must be 3).")
+    var passwordFD: Int32
 
     @Option(name: .long, help: "VNC connect timeout in seconds.")
     var connectTimeout: Int?
@@ -197,6 +197,7 @@ struct ClaudeKVMDaemon: AsyncParsableCommand {
     // MARK: - Daemon
 
     private func runDaemon() async throws {
+        let password = try CredentialInput.readInherited(fd: passwordFD)
         log("Starting daemon — VNC \(host):\(port)")
 
         var vncConfig = VNCConfiguration(

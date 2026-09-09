@@ -18,26 +18,7 @@ func vncMallocFrameBuffer(_ client: UnsafeMutablePointer<rfbClient>?) -> rfbBool
     guard let client else { return 0 }
     guard let b = bridge(from: client) else { return 0 }
 
-    let width = Int(client.pointee.width)
-    let height = Int(client.pointee.height)
-    let bpp = Int(client.pointee.format.bitsPerPixel) / 8
-    let size = width * height * bpp
-
-    if client.pointee.frameBuffer != nil {
-        free(client.pointee.frameBuffer)
-    }
-
-    guard let buffer = malloc(size) else {
-        b.log("Failed to allocate framebuffer: \(width)×\(height)×\(bpp)")
-        return 0
-    }
-
-    memset(buffer, 0, size)
-    client.pointee.frameBuffer = buffer.assumingMemoryBound(to: UInt8.self)
-    b.log("Framebuffer allocated: \(width)×\(height) (\(size) bytes)")
-    b.updateState(.connected(width: width, height: height))
-
-    return -1 // rfbBool TRUE = -1
+    return b.allocateFramebuffer(for: client)
 }
 
 /// Called once when all rectangles in a framebuffer update have been received.
@@ -58,9 +39,8 @@ func vncGotXCutText(
     _ client: UnsafeMutablePointer<rfbClient>?,
     _ text: UnsafePointer<CChar>?, _ len: Int32
 ) {
-    guard let b = bridge(from: client) else { return }
-    guard let text else { return }
-    b.log("Clipboard: \(String(cString: text))")
+    // Intentionally ignore this unsolicited payload without reading it.
+    // Clipboard content is neither retained nor logged.
 }
 
 // MARK: - ARD Authentication
