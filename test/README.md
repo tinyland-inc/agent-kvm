@@ -1,12 +1,11 @@
 # Validation
 
-In the approved remote Node.js environment:
+Run the offline proxy tests with Node.js:
 
 ```sh
 npm ci --ignore-scripts
 mkdir -p .test-tmp
 TMPDIR="$PWD/.test-tmp" npm run test:offline
-rmdir .test-tmp
 ```
 
 The scratch directory must be owned by the test user. Fixtures remove their
@@ -16,11 +15,9 @@ They use a fake native child and do not connect to a real desktop.
 
 `credential-input-cases.py` and `CredentialInputHarness.swift` exercise native
 credential input. `../Tests/VNCReconnectTests.swift` covers the Swift VNC
-lifecycle and framebuffer readiness. Darwin compilation belongs to the GF/PZM
-build lane; `../project.yml` declares its inputs.
+lifecycle and framebuffer readiness. [project.yml](../project.yml) declares
+the native build inputs.
 
 The retained `integration.js` and `agents/` files are historical manual live
 experiments. They can operate a desktop and consume provider credentials.
-They are not invoked by the offline command, and no automatic demo or cloud
-provisioning workflow is shipped by this fork. Their existence does not prove
-current release acceptance. Use lab's approved PZM acceptance procedure.
+They are not invoked by the offline command.
