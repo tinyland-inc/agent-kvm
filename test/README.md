@@ -1,7 +1,16 @@
 # Validation
 
-Run `npm ci --ignore-scripts` and `npm run test:offline` in the approved remote
-Node.js environment. The two credential tests cover framing, native child
+In the approved remote Node.js environment:
+
+```sh
+npm ci --ignore-scripts
+mkdir -p .test-tmp
+TMPDIR="$PWD/.test-tmp" npm run test:offline
+rmdir .test-tmp
+```
+
+The scratch directory must be owned by the test user. Fixtures remove their
+own files when they finish. The two credential tests cover framing, native child
 launch, password exclusion from arguments, and proxy behavior under failures.
 They use a fake native child and do not connect to a real desktop.
 

@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.test-tmp/
 
 # Environment variables & MCP config (contains credentials)
 .env

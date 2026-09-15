@@ -65,8 +65,9 @@ and do not establish live screen or reboot acceptance.
 
 ## Validation and release state
 
-Run `npm run test:offline` in a prepared remote development environment for
-the proxy's credential transport tests. Native tests require the declared
+Run `npm run test:offline` in a prepared remote development environment with
+`TMPDIR` pointing to an existing directory owned by the test user (see
+[validation instructions](test/README.md)). Native tests require the declared
 Darwin toolchain and dependencies in `project.yml`; use the owning remote
 build lane. Neo remains an editing, review, verification, and notarization seat.
 
