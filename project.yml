@@ -1,0 +1,155 @@
+name: Claude-KVM-Daemon
+options:
+  bundleIdPrefix: com.remrearas.claude-kvm-daemon
+  deploymentTarget:
+    macOS: "15.0"
+  xcodeVersion: "16.0"
+
+packages:
+  swift-argument-parser:
+    url: https://github.com/apple/swift-argument-parser
+    revision: "c8ed701b513cf5177118a175d85fbbbcd707ab41"
+
+targets:
+  claude-kvm-daemon:
+    type: tool
+    platform: macOS
+    sources:
+      - ClaudeKVM-Daemon
+    dependencies:
+      - package: swift-argument-parser
+        product: ArgumentParser
+    preBuildScripts:
+      - name: Verify qualified OpenSSL input before-link
+        script: |
+          exec /usr/bin/python3 -I "$SRCROOT/scripts/verify-openssl-input.py" "$TINYLAND_OPENSSL_LIBRARY_DIR" before-link
+        inputFiles:
+          - "$(SRCROOT)/scripts/verify-openssl-input.py"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"
+        showEnvVars: false
+        basedOnDependencyAnalysis: false
+        runOnlyWhenInstalling: false
+    postBuildScripts:
+      - name: Verify qualified OpenSSL input after-link
+        script: |
+          exec /usr/bin/python3 -I "$SRCROOT/scripts/verify-openssl-input.py" "$TINYLAND_OPENSSL_LIBRARY_DIR" after-link
+        inputFiles:
+          - "$(SRCROOT)/scripts/verify-openssl-input.py"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"
+        showEnvVars: false
+        basedOnDependencyAnalysis: false
+        runOnlyWhenInstalling: false
+    settings:
+      base:
+        # Required carrier input; no Homebrew or host-path fallback.
+        TINYLAND_OPENSSL_LIBRARY_DIR: ""
+        ARCHS: arm64
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        OTHER_SWIFT_FLAGS: "-parse-as-library"
+        SWIFT_INCLUDE_PATHS: "$(SRCROOT)/vendor/libvnc/prebuilt"
+        LIBRARY_SEARCH_PATHS:
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(SRCROOT)/vendor/libvnc/prebuilt"
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/vendor/libvnc/prebuilt/include"
+        OTHER_LDFLAGS:
+          - "-Wl,-search_paths_first"
+          - "-lvncclient"
+          - "-lz"
+          - "-lpthread"
+          - '"$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"'
+          - '"$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"'
+      configs:
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: -O
+
+
+  VNCReconnectTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - ClaudeKVM-Daemon/VNC
+      - Tests/VNCReconnectTests.swift
+    preBuildScripts:
+      - name: Verify qualified OpenSSL input before-link
+        script: |
+          exec /usr/bin/python3 -I "$SRCROOT/scripts/verify-openssl-input.py" "$TINYLAND_OPENSSL_LIBRARY_DIR" before-link
+        inputFiles:
+          - "$(SRCROOT)/scripts/verify-openssl-input.py"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"
+        showEnvVars: false
+        basedOnDependencyAnalysis: false
+        runOnlyWhenInstalling: false
+    postBuildScripts:
+      - name: Verify qualified OpenSSL input after-link
+        script: |
+          exec /usr/bin/python3 -I "$SRCROOT/scripts/verify-openssl-input.py" "$TINYLAND_OPENSSL_LIBRARY_DIR" after-link
+        inputFiles:
+          - "$(SRCROOT)/scripts/verify-openssl-input.py"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"
+        showEnvVars: false
+        basedOnDependencyAnalysis: false
+        runOnlyWhenInstalling: false
+    settings:
+      base:
+        # Required carrier input; no Homebrew or host-path fallback.
+        TINYLAND_OPENSSL_LIBRARY_DIR: ""
+        ARCHS: arm64
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        SWIFT_INCLUDE_PATHS: "$(SRCROOT)/vendor/libvnc/prebuilt"
+        LIBRARY_SEARCH_PATHS:
+          - "$(TINYLAND_OPENSSL_LIBRARY_DIR)"
+          - "$(SRCROOT)/vendor/libvnc/prebuilt"
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/vendor/libvnc/prebuilt/include"
+        OTHER_LDFLAGS:
+          - "-Wl,-search_paths_first"
+          - "-lvncclient"
+          - "-lz"
+          - "-lpthread"
+          - '"$(TINYLAND_OPENSSL_LIBRARY_DIR)/libssl.a"'
+          - '"$(TINYLAND_OPENSSL_LIBRARY_DIR)/libcrypto.a"'
+
+
+  CredentialInputHarness:
+    type: tool
+    platform: macOS
+    sources:
+      - ClaudeKVM-Daemon/CredentialInput.swift
+      - test/CredentialInputHarness.swift
+    settings:
+      base:
+        ARCHS: arm64
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        OTHER_SWIFT_FLAGS: "-parse-as-library"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+
+schemes:
+  claude-kvm-daemon:
+    build:
+      targets:
+        claude-kvm-daemon: all
+  VNCReconnectTests:
+    build:
+      targets:
+        VNCReconnectTests: [test]
+    test:
+      targets:
+        - name: VNCReconnectTests
+          parallelizable: false
+  CredentialInputHarness:
+    build:
+      targets:
+        CredentialInputHarness: all

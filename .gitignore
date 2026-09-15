@@ -1,12 +1,6 @@
-#  █████╗ ██████╗  █████╗ ███████╗
-# ██╔══██╗██╔══██╗██╔══██╗██╔════╝
-# ███████║██████╔╝███████║███████╗
-# ██╔══██║██╔══██╗██╔══██║╚════██║
-# ██║  ██║██║  ██║██║  ██║███████║
-# ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
-
 # Dependencies
 node_modules/
+.test-tmp/
 
 # Environment variables & MCP config (contains credentials)
 .env
@@ -31,3 +25,23 @@ screen-recording.mp4
 /tmp/
 *.ppm
 .DS_Store
+# Build
+.build/
+build/
+DerivedData/
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# macOS
+
+# IDE
+.vscode/
+
+# Claude
