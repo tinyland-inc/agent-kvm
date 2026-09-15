@@ -1,12 +1,12 @@
 {
   "name": "claude-kvm",
   "version": "2.0.12",
-  "description": "MCP server — control remote desktops via VNC (MacOS)",
+  "description": "Agent KVM: an MCP proxy for a native macOS VNC client",
   "license": "MIT",
   "author": "Rıza Emre ARAS <r.emrearas@proton.me>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ARAS-Workspace/claude-kvm.git"
+    "url": "git+https://github.com/tinyland-inc/agent-kvm.git"
   },
   "keywords": [
     "mcp",
@@ -18,7 +18,6 @@
     "apple-silicon",
     "native"
   ],
-  "mcpName": "io.github.ARAS-Workspace/claude-kvm",
   "main": "index.js",
   "bin": {
     "claude-kvm": "index.js"
@@ -42,5 +41,6 @@
     "@anthropic-ai/sdk": "^0.52.0",
     "@types/node": "^25.2.3",
     "dotenv": "^17.3.1"
-  }
+  },
+  "private": true
 }
