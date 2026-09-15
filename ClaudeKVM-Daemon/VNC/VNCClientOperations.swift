@@ -9,7 +9,7 @@ struct VNCClientOperations {
     var make: (VNCConfiguration) -> Client?
     var initialize: (Client) -> Bool
     var cleanup: (Client) -> Void
-    var poll: (Client, UInt32) -> Bool
+    var poll: (Client, UInt32, (VNCDecoderPhase) -> Void) -> Bool
     var incrementalUpdate: (Client) -> Void
     var allocateFramebuffer: (Int) -> UnsafeMutablePointer<UInt8>? = { malloc($0)?.assumingMemoryBound(to: UInt8.self) }
     var freeFramebuffer: (UnsafeMutablePointer<UInt8>) -> Void = { free($0) }
@@ -21,9 +21,13 @@ struct VNCClientOperations {
             return rfbInitClient(client, &argc, nil) != 0
         },
         cleanup: release,
-        poll: { client, interval in
+        poll: { client, interval, phase in
+            phase(.waitingForMessage)
+            defer { phase(.idle) }
             let result = WaitForMessage(client, interval)
-            return result >= 0 && (result == 0 || HandleRFBServerMessage(client) != 0)
+            guard result > 0 else { return result == 0 }
+            phase(.handlingServerMessage)
+            return HandleRFBServerMessage(client) != 0
         },
         incrementalUpdate: { _ = SendIncrementalFramebufferUpdateRequest($0) }
     )

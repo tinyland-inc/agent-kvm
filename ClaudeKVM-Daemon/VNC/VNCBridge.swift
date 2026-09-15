@@ -53,6 +53,11 @@ final class VNCBridge: @unchecked Sendable {
         var waiters: [UUID: FrameWaiter] = [:]
     }
     private let frameReadiness = OSAllocatedUnfairLock(initialState: FrameReadiness())
+    private struct FrameDiagnosticsState {
+        var snapshot = VNCFramebufferDiagnostics()
+        var lastCallbackNs: UInt64?
+    }
+    private let frameDiagnostics = OSAllocatedUnfairLock(initialState: FrameDiagnosticsState())
     private let stateStorage = OSAllocatedUnfairLock(initialState: VNCConnectionState.disconnected)
     // Desired connection identity is independently cancellable while a bounded
     // native call occupies the queue. Every C client access belongs to the queue.
@@ -122,6 +127,10 @@ final class VNCBridge: @unchecked Sendable {
 
     private func cleanupClient() {
         clientReady = false
+        frameDiagnostics.withLock {
+            $0.snapshot.phase = .disconnected
+            $0.snapshot.complete = false
+        }
         publishFrameReadiness(available: false, complete: false)
         if let owned = client {
             client = nil
@@ -148,6 +157,19 @@ final class VNCBridge: @unchecked Sendable {
               size <= Self.maximumFramebufferBytes else { return 0 }
         native.pointee.frameBuffer = nil
         releaseFramebuffer()
+        // Publish the accepted allocation attempt before allocator/zeroing can
+        // block or fail. Never retain an old complete frame in deadline evidence.
+        frameDiagnostics.withLock { state in
+            let previous = state.snapshot
+            state.snapshot = VNCFramebufferDiagnostics()
+            state.snapshot.connectionGeneration = previous.connectionGeneration
+            state.snapshot.allocations = previous.allocations &+ 1
+            state.snapshot.phase = previous.phase
+            state.snapshot.width = width
+            state.snapshot.height = height
+            state.snapshot.pixelsRemaining = pixels
+            state.lastCallbackNs = DispatchTime.now().uptimeNanoseconds
+        }
         publishFrameReadiness(available: activeClient != nil, complete: false)
         guard let buffer = operations.allocateFramebuffer(size) else { return 0 }
         memset(buffer, 0, size)
@@ -166,12 +188,24 @@ final class VNCBridge: @unchecked Sendable {
         guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
               native.pointee.frameBuffer != nil,
               let session = clientSession, wants(session) else { return }
+        frameDiagnostics.withLock {
+            $0.snapshot.rectangles &+= 1
+            $0.lastCallbackNs = DispatchTime.now().uptimeNanoseconds
+        }
+        defer { frameDiagnostics.withLock { $0.snapshot.pixelsRemaining = framebufferPixelsRemaining } }
         // LibVNCClient emits GotFrameBufferUpdate after GotCopyRect too. The
         // copy callback has already propagated validity from its source region.
-        if copyRectanglePending { copyRectanglePending = false; return }
+        if copyRectanglePending {
+            copyRectanglePending = false
+            frameDiagnostics.withLock { $0.snapshot.skippedCopyRectangles &+= 1 }
+            return
+        }
         guard x >= 0, y >= 0, width > 0, height > 0,
               Int64(x) + Int64(width) <= Int64(native.pointee.width),
-              Int64(y) + Int64(height) <= Int64(native.pointee.height) else { return }
+              Int64(y) + Int64(height) <= Int64(native.pointee.height) else {
+            frameDiagnostics.withLock { $0.snapshot.rejectedRectangles &+= 1 }
+            return
+        }
         guard !framebufferHasUpdate else { return }
         // Track the union, including rectangles split across update messages.
         // Work is bounded by rectangle area; duplicate rectangles add no bits.
@@ -201,6 +235,11 @@ final class VNCBridge: @unchecked Sendable {
         guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
               native.pointee.frameBuffer != nil,
               let session = clientSession, wants(session) else { return }
+        frameDiagnostics.withLock {
+            $0.snapshot.copyRectangles &+= 1
+            $0.lastCallbackNs = DispatchTime.now().uptimeNanoseconds
+        }
+        defer { frameDiagnostics.withLock { $0.snapshot.pixelsRemaining = framebufferPixelsRemaining } }
         copyRectanglePending = true
         let stride = Int(native.pointee.width), rows = Int(native.pointee.height)
         guard let render = nativeCopyRectangle,
@@ -209,7 +248,10 @@ final class VNCBridge: @unchecked Sendable {
               Int64(sourceX) + Int64(width) <= Int64(stride),
               Int64(destinationX) + Int64(width) <= Int64(stride),
               Int64(sourceY) + Int64(height) <= Int64(rows),
-              Int64(destinationY) + Int64(height) <= Int64(rows) else { return }
+              Int64(destinationY) + Int64(height) <= Int64(rows) else {
+            frameDiagnostics.withLock { $0.snapshot.rejectedRectangles &+= 1 }
+            return
+        }
         render(native, sourceX, sourceY, width, height, destinationX, destinationY)
         guard !framebufferHasUpdate else { return }
         for rowIndex in 0..<Int(height) {
@@ -234,9 +276,15 @@ final class VNCBridge: @unchecked Sendable {
     /// Once initialized, later incremental updates need not cover the screen.
     func finishedFramebufferUpdate(for native: UnsafeMutablePointer<rfbClient>) {
         guard DispatchQueue.getSpecific(key: queueKey) != nil, client == native,
-              native.pointee.frameBuffer != nil, framebufferPixelsRemaining == 0,
+              native.pointee.frameBuffer != nil,
               let session = clientSession, wants(session) else { return }
+        frameDiagnostics.withLock {
+            $0.snapshot.finishedUpdates &+= 1
+            $0.lastCallbackNs = DispatchTime.now().uptimeNanoseconds
+        }
+        guard framebufferPixelsRemaining == 0 else { return }
         framebufferHasUpdate = true
+        frameDiagnostics.withLock { $0.snapshot.complete = true }
         initialFramebufferCoverage = []
         if clientReady { publishFrameReadiness(available: true, complete: true) }
         framebufferUpdateContinuation?.yield(())
@@ -321,6 +369,12 @@ final class VNCBridge: @unchecked Sendable {
         }
         client = newClient
         clientReady = false
+        frameDiagnostics.withLock { state in
+            let generation = state.snapshot.connectionGeneration &+ 1
+            state = FrameDiagnosticsState()
+            state.snapshot.connectionGeneration = generation
+            state.snapshot.phase = .initializing
+        }
         newClient.pointee.serverPort = Int32(config.port)
         newClient.pointee.serverHost = strdup(config.host)
         rfbClientSetClientData(newClient, &vncBridgeTag,
@@ -340,6 +394,7 @@ final class VNCBridge: @unchecked Sendable {
         newClient.pointee.readTimeout = UInt32(timeout)
         // On failure LibVNCClient consumes the client. Do not clean it twice.
         guard operations.initialize(newClient) else {
+            frameDiagnostics.withLock { $0.snapshot.phase = .disconnected }
             client = nil // the C pointer has already been consumed
             releaseFramebuffer()
             if !wants(session) { throw CancellationError() }
@@ -350,6 +405,7 @@ final class VNCBridge: @unchecked Sendable {
             throw CancellationError()
         }
         clientReady = true
+        frameDiagnostics.withLock { $0.snapshot.phase = .idle }
         publishFrameReadiness(available: true, complete: framebufferHasUpdate)
         updateState(.connected(width: Int(newClient.pointee.width), height: Int(newClient.pointee.height)))
         // A connected callback may request disconnect; never schedule work or
@@ -445,7 +501,24 @@ final class VNCBridge: @unchecked Sendable {
         }
         guard let continuation else { return }
         if cancelled { continuation.resume(throwing: CancellationError()) }
-        else { continuation.resume(throwing: VNCError.sendFailed("No complete framebuffer update within 5 seconds")) }
+        else {
+            let evidence = framebufferDiagnostics.encoded
+            continuation.resume(throwing: VNCError.sendFailed(
+                "No complete framebuffer update within 5 seconds; diagnostics=\(evidence)"))
+        }
+    }
+
+    /// Never dispatch to the native queue here: HandleRFBServerMessage may be
+    /// blocked waiting for bytes when the independent five-second deadline fires.
+    var framebufferDiagnostics: VNCFramebufferDiagnostics {
+        frameDiagnostics.withLock { state in
+            var snapshot = state.snapshot
+            if let lastCallbackNs = state.lastCallbackNs {
+                snapshot.lastCallbackAgeMilliseconds =
+                    (DispatchTime.now().uptimeNanoseconds &- lastCallbackNs) / 1_000_000
+            }
+            return snapshot
+        }
     }
 
     /// Wait without occupying the native queue: it must keep receiving pixels.
@@ -578,7 +651,9 @@ final class VNCBridge: @unchecked Sendable {
             guard let self, self.clientSession == session, self.wants(session),
                   let client = self.client else { return }
             self.pendingWork = nil
-            guard self.operations.poll(client, min(max(self.config.messageLoopInterval, 500), 250_000)) else {
+            guard self.operations.poll(client, min(max(self.config.messageLoopInterval, 500), 250_000), {
+                phase in self.frameDiagnostics.withLock { $0.snapshot.phase = phase }
+            }) else {
                 self.cleanupClient()
                 guard self.wants(session) else { return }
                 self.updateState(.error("Connection lost"))
@@ -588,7 +663,9 @@ final class VNCBridge: @unchecked Sendable {
             guard self.wants(session) else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- self.lastUpdateRequestNs > 50_000_000 {
+                self.frameDiagnostics.withLock { $0.snapshot.phase = .requestingIncrementalUpdate }
                 self.operations.incrementalUpdate(client)
+                self.frameDiagnostics.withLock { $0.snapshot.phase = .idle }
                 self.lastUpdateRequestNs = now
             }
             self.enqueuePoll(session)

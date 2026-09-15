@@ -117,8 +117,10 @@ private final class FakeNative {
             }
             return true
         }, cleanup: { [self] in release($0, failed: false) },
-        poll: { [self] client, interval in
+        poll: { [self] client, interval, phase in
+            phase(.handlingServerMessage)
             beforePoll?(client)
+            phase(.idle)
             lock.lock(); defer { lock.unlock() }
             pollIntervals.append(interval)
             return polls.isEmpty ? true : polls.removeFirst()
@@ -141,6 +143,39 @@ private final class FakeNative {
 }
 
 final class VNCReconnectTests: XCTestCase {
+    private func timeoutDiagnostics(_ reason: String,
+                                    file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        let prefix = "No complete framebuffer update within 5 seconds; diagnostics="
+        XCTAssertTrue(reason.hasPrefix(prefix), file: file, line: line)
+        let payload = String(reason.dropFirst(prefix.count))
+        XCTAssertLessThanOrEqual(payload.utf8.count, 1024, file: file, line: line)
+        let data = Data(payload.utf8)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                   file: file, line: line)
+        let required: Set<String> = [
+            "connection_generation", "allocations", "width", "height", "pixels_remaining",
+            "rectangles", "copy_rectangles", "finished_updates", "rejected_rectangles",
+            "skipped_copy_rectangles", "complete", "phase"
+        ]
+        let keys = Set(object.keys)
+        XCTAssertTrue(required.isSubset(of: keys), file: file, line: line)
+        XCTAssertTrue(keys.isSubset(of: required.union(["last_callback_age_milliseconds"])),
+                      file: file, line: line)
+        for key in required.subtracting(["complete", "phase"]) {
+            XCTAssertNotNil(object[key] as? Int, "non-numeric diagnostic: \(key)", file: file, line: line)
+        }
+        XCTAssertNotNil(object["complete"] as? Bool, file: file, line: line)
+        let phases: Set<String> = ["initializing", "idle", "waitingForMessage",
+                                   "handlingServerMessage", "requestingIncrementalUpdate", "disconnected"]
+        XCTAssertTrue(phases.contains(object["phase"] as? String ?? ""), file: file, line: line)
+        if let age = object["last_callback_age_milliseconds"], !(age is NSNull) {
+            XCTAssertNotNil(age as? UInt64, file: file, line: line)
+        }
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), data,
+                       "diagnostics must be compact, sorted JSON", file: file, line: line)
+        return object
+    }
+
     func testFailedRetriesContinueAndRecoverWithBoundedBackoff() async throws {
         let native = FakeNative(outcomes: [true, false, false, true])
         let clock = ManualScheduler()
@@ -432,12 +467,21 @@ final class VNCReconnectTests: XCTestCase {
         let clock = ManualScheduler(); let deadline = ManualScheduler()
         let registered = expectation(description: "partial initial screen retains original deadline")
         deadline.onSchedule = { registered.fulfill() }
-        let bridge = VNCBridge(operations: native.operations, schedule: clock.schedule,
+        var config = VNCConfiguration()
+        config.host = "fixture-private-host.invalid"
+        config.username = "fixture-private-user"
+        config.password = "fixture-private-password"
+        let bridge = VNCBridge(config: config, operations: native.operations, schedule: clock.schedule,
                                scheduleFrameDeadline: deadline.schedule)
         try await bridge.connect()
         let waiting = Task { try await bridge.waitForFramebuffer() }
         await fulfillment(of: [registered], timeout: 3)
         native.beforePoll = { [weak bridge] client in
+            // Neither pixels nor configured connection secrets belong in a
+            // coverage/control-flow diagnostic.
+            _ = Array("PIXEL_PRIVATE".utf8).withUnsafeBytes { bytes in
+                memcpy(client.pointee.frameBuffer!, bytes.baseAddress!, bytes.count)
+            }
             // Summed area exceeds the screen; the bottom-right pixel is still
             // absent. Completion of each message cannot bless that hole.
             let rectangles: [(Int32, Int32, Int32, Int32)] =
@@ -449,11 +493,31 @@ final class VNCReconnectTests: XCTestCase {
             }
         }
         clock.runNext()
+        let partial = bridge.framebufferDiagnostics
+        XCTAssertEqual(partial.connectionGeneration, 1)
+        XCTAssertEqual(partial.allocations, 1)
+        XCTAssertEqual(partial.width, 2)
+        XCTAssertEqual(partial.height, 2)
+        XCTAssertEqual(partial.pixelsRemaining, 1)
+        XCTAssertEqual(partial.rectangles, 3)
+        XCTAssertEqual(partial.finishedUpdates, 3)
+        XCTAssertEqual(partial.copyRectangles, 0)
+        XCTAssertEqual(partial.rejectedRectangles, 0)
+        XCTAssertEqual(partial.skippedCopyRectangles, 0)
+        XCTAssertFalse(partial.complete)
+        XCTAssertNotNil(partial.lastCallbackAgeMilliseconds)
         XCTAssertEqual(deadline.delays, [5])
         deadline.runNext()
         do { try await waiting.value; XCTFail("partial screen admitted") }
         catch VNCError.sendFailed(let reason) {
-            XCTAssertEqual(reason, "No complete framebuffer update within 5 seconds")
+            let diagnostic = try timeoutDiagnostics(reason)
+            XCTAssertEqual(diagnostic["pixels_remaining"] as? Int, 1)
+            XCTAssertEqual(diagnostic["rectangles"] as? Int, 3)
+            XCTAssertEqual(diagnostic["finished_updates"] as? Int, 3)
+            XCTAssertEqual(diagnostic["complete"] as? Bool, false)
+            for privateValue in [config.host, config.username!, config.password!, "PIXEL_PRIVATE"] {
+                XCTAssertFalse(reason.contains(privateValue))
+            }
         } catch { XCTFail("unexpected error") }
         native.beforePoll = { [weak bridge] client in
             vncGotFrameBufferUpdate(client, 1, 1, 1, 1)
@@ -462,6 +526,8 @@ final class VNCReconnectTests: XCTestCase {
         }
         clock.runNext(); try await bridge.waitForFramebuffer()
         XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer.count }, 16)
+        XCTAssertEqual(bridge.framebufferDiagnostics.pixelsRemaining, 0)
+        XCTAssertTrue(bridge.framebufferDiagnostics.complete)
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
         XCTAssertEqual(native.bufferCounts.live, 0)
     }
@@ -500,11 +566,20 @@ final class VNCReconnectTests: XCTestCase {
         let clock = ManualScheduler(); let bridge = VNCBridge(operations: native.operations,
                                                               schedule: clock.schedule)
         try await bridge.connect()
+        let generation = bridge.framebufferDiagnostics.connectionGeneration
         native.beforePoll = { [weak bridge] client in
             vncGotFrameBufferUpdate(client, 0, 0, 2, 1)
             vncFinishedFrameBufferUpdate(client)
             XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
             XCTAssertNotEqual(vncMallocFrameBuffer(client), 0)
+            if let diagnostic = bridge?.framebufferDiagnostics {
+                XCTAssertEqual(diagnostic.connectionGeneration, generation)
+                XCTAssertEqual(diagnostic.allocations, 2)
+                XCTAssertEqual(diagnostic.pixelsRemaining, 4)
+                XCTAssertEqual(diagnostic.rectangles, 0)
+                XCTAssertEqual(diagnostic.finishedUpdates, 0)
+                XCTAssertFalse(diagnostic.complete)
+            }
             vncGotFrameBufferUpdate(client, 0, 1, 2, 1)
             vncFinishedFrameBufferUpdate(client)
             XCTAssertNil(bridge?.withFramebuffer { buffer, _, _ in buffer.count })
@@ -513,6 +588,10 @@ final class VNCReconnectTests: XCTestCase {
         }
         clock.runNext(); try await bridge.waitForFramebuffer()
         XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer.count }, 16)
+        XCTAssertEqual(bridge.framebufferDiagnostics.rectangles, 2)
+        XCTAssertEqual(bridge.framebufferDiagnostics.finishedUpdates, 2)
+        XCTAssertEqual(bridge.framebufferDiagnostics.pixelsRemaining, 0)
+        XCTAssertTrue(bridge.framebufferDiagnostics.complete)
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
         XCTAssertEqual(native.bufferCounts.allocated, 2)
         XCTAssertEqual(native.bufferCounts.released, 2)
@@ -559,6 +638,9 @@ final class VNCReconnectTests: XCTestCase {
         }
         clock.runNext(); try await bridge.waitForFramebuffer()
         XCTAssertEqual(bridge.withFramebuffer { buffer, _, _ in buffer[0] }, 0x4B)
+        XCTAssertEqual(bridge.framebufferDiagnostics.copyRectangles, 2)
+        XCTAssertEqual(bridge.framebufferDiagnostics.skippedCopyRectangles, 2)
+        XCTAssertEqual(bridge.framebufferDiagnostics.rectangles, 4)
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
         XCTAssertEqual(native.bufferCounts.live, 0)
     }
@@ -614,6 +696,10 @@ final class VNCReconnectTests: XCTestCase {
         }
         clock.runNext()
         XCTAssertEqual(events.values, [])
+        XCTAssertEqual(bridge.framebufferDiagnostics.rejectedRectangles, 7)
+        XCTAssertEqual(bridge.framebufferDiagnostics.rectangles, 7)
+        XCTAssertEqual(bridge.framebufferDiagnostics.finishedUpdates, 8)
+        XCTAssertEqual(bridge.framebufferDiagnostics.pixelsRemaining, 4)
         XCTAssertEqual(deadline.delays, [5]) // metadata never renews the deadline
         native.beforePoll = { completePixelUpdate($0) }
         clock.runNext(); try await waiting.value
@@ -639,12 +725,40 @@ final class VNCReconnectTests: XCTestCase {
         }
         let polling = Task.detached { clock.runNext() }
         await fulfillment(of: [entered], timeout: 3)
-        deadline.runNext()
-        do { try await waiting.value; XCTFail("missing update accepted") }
-        catch VNCError.sendFailed(let reason) {
-            XCTAssertEqual(reason, "No complete framebuffer update within 5 seconds")
-        } catch { XCTFail("unexpected error") }
+        let snapshotFinished = expectation(description: "diagnostic snapshot bypasses occupied native queue")
+        let snapshot = Task.detached {
+            let value = bridge.framebufferDiagnostics
+            snapshotFinished.fulfill()
+            return value
+        }
+        let timeoutFinished = expectation(description: "diagnostic timeout bypasses occupied native queue")
+        let timeout = Task { () -> String? in
+            defer { timeoutFinished.fulfill() }
+            do { try await waiting.value; XCTFail("missing update accepted") }
+            catch VNCError.sendFailed(let reason) { return reason }
+            catch { XCTFail("unexpected error") }
+            return nil
+        }
+        let firing = Task.detached { deadline.runNext() }
+        // A regression may fail these expectations, but releasing the owned
+        // barrier still lets all test tasks unwind instead of hanging XCTest.
+        await fulfillment(of: [snapshotFinished, timeoutFinished], timeout: 2)
         release.signal(); await polling.value
+        await firing.value
+        let occupied = await snapshot.value
+        XCTAssertEqual(occupied.phase, .handlingServerMessage)
+        XCTAssertEqual(occupied.allocations, 1)
+        XCTAssertEqual(occupied.pixelsRemaining, 4)
+        XCTAssertEqual(occupied.rectangles, 0)
+        XCTAssertEqual(occupied.finishedUpdates, 0)
+        XCTAssertFalse(occupied.complete)
+        let reason = await timeout.value
+        let diagnostic = try timeoutDiagnostics(try XCTUnwrap(reason))
+        XCTAssertEqual(diagnostic["phase"] as? String, "handlingServerMessage")
+        XCTAssertEqual(diagnostic["pixels_remaining"] as? Int, 4)
+        XCTAssertEqual(diagnostic["rectangles"] as? Int, 0)
+        XCTAssertEqual(diagnostic["finished_updates"] as? Int, 0)
+        XCTAssertEqual(diagnostic["complete"] as? Bool, false)
         XCTAssertNil(bridge.withFramebuffer { buffer, _, _ in buffer.count })
         // A timeout neither invents a frame nor disables a later real update.
         native.beforePoll = { completePixelUpdate($0) }
@@ -717,6 +831,9 @@ final class VNCReconnectTests: XCTestCase {
         let bridge = VNCBridge(operations: native.operations, schedule: clock.schedule,
                                scheduleFrameDeadline: deadline.schedule)
         try await bridge.connect(); try await bridge.waitForFramebuffer()
+        let original = bridge.framebufferDiagnostics
+        XCTAssertTrue(original.complete)
+        XCTAssertEqual(original.rectangles, 1)
         native.completeDuringInitialize = false
         clock.runNext() // loss of the previously complete frame
         do { try await bridge.waitForFramebuffer(); XCTFail("lost connection accepted") }
@@ -724,10 +841,27 @@ final class VNCReconnectTests: XCTestCase {
         clock.runNext() // successful reconnect, only allocated so far
         XCTAssertTrue(bridge.connectionState.isConnected)
         XCTAssertNil(bridge.withFramebuffer { buffer, _, _ in buffer.count })
+        let reconnected = bridge.framebufferDiagnostics
+        XCTAssertEqual(reconnected.connectionGeneration, original.connectionGeneration + 1)
+        XCTAssertEqual(reconnected.allocations, 1)
+        XCTAssertEqual(reconnected.width, 2)
+        XCTAssertEqual(reconnected.height, 2)
+        XCTAssertEqual(reconnected.pixelsRemaining, 4)
+        XCTAssertEqual(reconnected.rectangles, 0)
+        XCTAssertEqual(reconnected.copyRectangles, 0)
+        XCTAssertEqual(reconnected.finishedUpdates, 0)
+        XCTAssertEqual(reconnected.rejectedRectangles, 0)
+        XCTAssertEqual(reconnected.skippedCopyRectangles, 0)
+        XCTAssertFalse(reconnected.complete)
         let waiting = Task { try await bridge.waitForFramebuffer() }
         await fulfillment(of: [registered], timeout: 3)
         native.beforePoll = { completePixelUpdate($0) }
         clock.runNext(); try await waiting.value
+        XCTAssertEqual(bridge.framebufferDiagnostics.connectionGeneration, reconnected.connectionGeneration)
+        XCTAssertEqual(bridge.framebufferDiagnostics.rectangles, 1)
+        XCTAssertEqual(bridge.framebufferDiagnostics.finishedUpdates, 1)
+        XCTAssertEqual(bridge.framebufferDiagnostics.pixelsRemaining, 0)
+        XCTAssertTrue(bridge.framebufferDiagnostics.complete)
         deadline.runNext()
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
         XCTAssertEqual(native.counts.peak, 1)
@@ -748,6 +882,14 @@ final class VNCReconnectTests: XCTestCase {
         }
         clock.runNext()
         XCTAssertNil(bridge.withFramebuffer { buffer, _, _ in buffer.count })
+        let resized = bridge.framebufferDiagnostics
+        XCTAssertEqual(resized.allocations, 2)
+        XCTAssertEqual(resized.width, 3)
+        XCTAssertEqual(resized.height, 3)
+        XCTAssertEqual(resized.pixelsRemaining, 9)
+        XCTAssertEqual(resized.rectangles, 0)
+        XCTAssertEqual(resized.finishedUpdates, 0)
+        XCTAssertFalse(resized.complete)
         let waiting = Task { try await bridge.waitForFramebuffer() }
         await fulfillment(of: [registered], timeout: 3)
         native.beforePoll = { completePixelUpdate($0) }
@@ -756,6 +898,25 @@ final class VNCReconnectTests: XCTestCase {
             XCTAssertEqual(width, 3); XCTAssertEqual(height, 3)
             return buffer.count
         }, 36)
+        // The owned allocator refuses this 1156-byte request before malloc.
+        // Diagnostics must describe the failed new attempt, not the old frame.
+        native.beforePoll = { client in
+            client.pointee.width = 17; client.pointee.height = 17
+            XCTAssertEqual(vncMallocFrameBuffer(client), 0)
+        }
+        clock.runNext()
+        let refused = bridge.framebufferDiagnostics
+        XCTAssertEqual(refused.allocations, 3)
+        XCTAssertEqual(refused.width, 17)
+        XCTAssertEqual(refused.height, 17)
+        XCTAssertEqual(refused.pixelsRemaining, 289)
+        XCTAssertEqual(refused.rectangles, 0)
+        XCTAssertEqual(refused.copyRectangles, 0)
+        XCTAssertEqual(refused.finishedUpdates, 0)
+        XCTAssertEqual(refused.rejectedRectangles, 0)
+        XCTAssertEqual(refused.skippedCopyRectangles, 0)
+        XCTAssertFalse(refused.complete)
+        XCTAssertNil(bridge.withFramebuffer { buffer, _, _ in buffer.count })
         bridge.disconnect(); XCTAssertEqual(bridge.framebufferWidth, 0)
         XCTAssertEqual(native.bufferCounts.allocated, 2)
         XCTAssertEqual(native.bufferCounts.released, 2)

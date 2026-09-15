@@ -1,5 +1,39 @@
 import Foundation
 
+/// Diagnostics describe control flow and coverage only, never framebuffer,
+/// clipboard, credentials, or server-supplied text. The native queue publishes
+/// bounded snapshots so a blocked decoder cannot block the frame deadline.
+enum VNCDecoderPhase: String, Codable, Sendable {
+    case disconnected, initializing, idle, waitingForMessage
+    case handlingServerMessage, requestingIncrementalUpdate
+}
+
+struct VNCFramebufferDiagnostics: Codable, Sendable {
+    var connectionGeneration = 0
+    // Accepted allocation attempts, including a later allocator failure.
+    var allocations = 0
+    var width = 0
+    var height = 0
+    var pixelsRemaining = 0
+    var rectangles = 0
+    var copyRectangles = 0
+    var finishedUpdates = 0
+    var rejectedRectangles = 0
+    var skippedCopyRectangles = 0
+    var complete = false
+    var phase = VNCDecoderPhase.disconnected
+    var lastCallbackAgeMilliseconds: UInt64?
+
+    var encoded: String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = [.sortedKeys]
+        // Only finite integer, boolean, and enum values enter this payload.
+        guard let data = try? encoder.encode(self) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 // MARK: - Connection State
 
 enum VNCConnectionState: Sendable, CustomStringConvertible {
